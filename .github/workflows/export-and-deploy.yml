@@ -1,0 +1,50 @@
+name: Export products and deploy to WordPress
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'   # dagelijks 02:00 UTC (pas aan)
+  push:
+    branches:
+      - main
+
+jobs:
+  export-and-deploy:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup PowerShell
+        uses: actions/setup-powershell@v2
+
+      - name: Run export script
+        env:
+          DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
+        run: |
+          pwsh -NoProfile -NonInteractive -Command "./export-products.ps1 -OutputDir './pjm-data' -ColumnsConfig './columns.json'"
+
+      - name: Archive export
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjm-export
+          path: pjm-data/**
+
+      - name: Upload via SFTP (WinSCP)
+        if: ${{ secrets.WP_SSH_HOST != '' }}
+        env:
+          WP_SSH_HOST: ${{ secrets.WP_SSH_HOST }}
+          WP_SSH_PORT: ${{ secrets.WP_SSH_PORT }}
+          WP_SSH_USER: ${{ secrets.WP_SSH_USER }}
+          WP_SSH_KEY: ${{ secrets.WP_SSH_KEY }}
+          WP_TARGET_PATH: ${{ secrets.WP_TARGET_PATH }}
+        run: |
+          $keyFile = "$env:RUNNER_TEMP\wp_ssh_key"
+          [System.IO.File]::WriteAllText($keyFile, $env:WP_SSH_KEY)
+          icacls $keyFile /inheritance:r
+          & "C:\Program Files (x86)\WinSCP\WinSCP.com" /command `
+            "open sftp://$env:WP_SSH_USER@$env:WP_SSH_HOST:$env:WP_SSH_PORT/ -privatekey=$keyFile -hostkey=* " `
+            "mkdir $env:WP_TARGET_PATH" `
+            "put -r pjm-data/* $env:WP_TARGET_PATH/" `
+            "exit"
