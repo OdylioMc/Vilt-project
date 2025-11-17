@@ -15,8 +15,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup PowerShell
-        uses: actions/setup-powershell@v2
+      # Setup PowerShell verwijderd — windows-latest bevat PowerShell/Pwsh al
 
       - name: Run export script
         env:
@@ -32,7 +31,7 @@ jobs:
           path: pjm-data/**
 
       - name: Upload via SFTP/SSH (OpenSSH scp)
-        # We removed the YAML-level if and do a runtime guard inside the script below
+        # runtime guard inside script (vermijdt YAML parse issues)
         env:
           WP_SSH_HOST: ${{ secrets.WP_SSH_HOST }}
           WP_SSH_PORT: ${{ secrets.WP_SSH_PORT }}
