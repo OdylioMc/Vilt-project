@@ -1,38 +1,89 @@
-param(
-  [string]$OutputDir = 'pjm-data',
-  [string]$ColumnsConfig = './columns.json'
-)
+<?php
+/**
+ * export-products.php
+ *
+ * Simple CLI exporter: reads DB_CONNECTION_STRING from env, runs a query and writes JSON to pjm-data/products.json
+ *
+ * Usage (in GitHub Actions): php ./export-products.php
+ *
+ * DB_CONNECTION_STRING format (example):
+ *   mysql://dbuser:secret@db-host.example.com:3306/mydatabase
+ *
+ * Edit $query below to match your actual products table and columns.
+ */
 
-Write-Host "Starting export-products.ps1"
-Write-Host "OutputDir: ${OutputDir}"
-Write-Host "ColumnsConfig: ${ColumnsConfig}"
+$dsnEnv = getenv('DB_CONNECTION_STRING');
 
-# Optioneel: toon of DB_CONNECTION_STRING aanwezig is (NIET de waarde loggen in productie)
-if ($env:DB_CONNECTION_STRING) {
-  Write-Host "DB_CONNECTION_STRING is set (using it if your real script supports DB export)"
-} else {
-  Write-Host "DB_CONNECTION_STRING is NOT set - generating sample data instead"
+if (!$dsnEnv) {
+    fwrite(STDERR, "ERROR: DB_CONNECTION_STRING environment variable is not set.\n");
+    exit(1);
 }
 
-# Zorg dat outputmap bestaat
-if (-not (Test-Path -Path $OutputDir)) {
-  New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+// Parse a DSN like: mysql://user:pass@host:port/dbname
+$parts = parse_url($dsnEnv);
+if ($parts === false || !isset($parts['scheme']) || $parts['scheme'] !== 'mysql') {
+    fwrite(STDERR, "ERROR: DB_CONNECTION_STRING has wrong format. Expected mysql://user:pass@host:port/dbname\n");
+    exit(1);
 }
 
-# Voorbeeld: schrijf een sample products.json zodat Actions iets kan uploaden
-$products = @(
-  @{ id = 1; name = 'Voorbeeld product A'; price = 9.99 },
-  @{ id = 2; name = 'Voorbeeld product B'; price = 19.9 }
-)
-$products | ConvertTo-Json -Depth 5 | Out-File -FilePath (Join-Path $OutputDir 'products.json') -Encoding utf8
+$user = $parts['user'] ?? '';
+$pass = $parts['pass'] ?? '';
+$host = $parts['host'] ?? '127.0.0.1';
+$port = $parts['port'] ?? 3306;
+$dbname = ltrim($parts['path'] ?? '', '/');
 
-# Kopieer eventueel columns-config als die bestaat (optioneel)
-if (Test-Path -Path $ColumnsConfig) {
-  Copy-Item -Path $ColumnsConfig -Destination (Join-Path $OutputDir (Split-Path $ColumnsConfig -Leaf)) -Force
+if (!$dbname) {
+    fwrite(STDERR, "ERROR: database name missing in DB_CONNECTION_STRING\n");
+    exit(1);
 }
 
-Write-Host "Export complete. Files in ${OutputDir}:"
-Get-ChildItem -Path $OutputDir -Recurse | ForEach-Object { Write-Host "  " $_.FullName }
+// Configure DSN for PDO
+$pdoDsn = "mysql:host={$host};port={$port};dbname={$dbname};charset=utf8mb4";
 
-# Succes exitcode
-exit 0
+try {
+    $pdo = new PDO($pdoDsn, $user, $pass, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ]);
+} catch (Exception $ex) {
+    fwrite(STDERR, "ERROR: could not connect to database: " . $ex->getMessage() . "\n");
+    exit(1);
+}
+
+// ====== ADAPT THIS QUERY TO YOUR SCHEMA ======
+// Example: select id, title, price from your products table
+// If your product table is wp_posts + meta or WooCommerce, you will need to join wp_postmeta or use WooCommerce REST API instead.
+$query = "SELECT id, title, price FROM products LIMIT 10000";
+// ============================================
+
+try {
+    $stmt = $pdo->query($query);
+    $rows = $stmt->fetchAll();
+} catch (Exception $ex) {
+    fwrite(STDERR, "ERROR: query failed: " . $ex->getMessage() . "\n");
+    exit(1);
+}
+
+$outputDir = 'pjm-data';
+if (!is_dir($outputDir)) {
+    if (!mkdir($outputDir, 0775, true)) {
+        fwrite(STDERR, "ERROR: failed to create output directory: {$outputDir}\n");
+        exit(1);
+    }
+}
+
+$outFile = $outputDir . DIRECTORY_SEPARATOR . 'products.json';
+$json = json_encode($rows, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+if ($json === false) {
+    fwrite(STDERR, "ERROR: failed to encode JSON\n");
+    exit(1);
+}
+
+if (file_put_contents($outFile, $json) === false) {
+    fwrite(STDERR, "ERROR: failed to write file: {$outFile}\n");
+    exit(1);
+}
+
+echo "Wrote " . count($rows) . " products to {$outFile}\n";
+exit(0);
