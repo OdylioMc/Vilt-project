@@ -3,7 +3,7 @@ name: Export products and deploy to WordPress
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'   # dagelijks 02:00 UTC (pas aan)
+    - cron: '0 2 * * *'
   push:
     branches:
       - main
@@ -15,13 +15,26 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Setup PowerShell verwijderd — windows-latest bevat PowerShell/Pwsh al
-
       - name: Run export script
         env:
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
         run: |
-          pwsh -NoProfile -NonInteractive -Command "./export-products.ps1 -OutputDir './pjm-data' -ColumnsConfig './columns.json'"
+          pwsh -NoProfile -NonInteractive -File ./export-products.ps1 -OutputDir 'pjm-data' -ColumnsConfig './columns.json'
+
+      - name: Debug: show working dir and list pjmdat a
+        # laat zien waar we zitten en wat er in pjm-data staat
+        run: |
+          pwsh -NoProfile -NoLogo -Command "
+            Write-Host 'Current directory:' (Get-Location).Path;
+            Write-Host 'Repository root listing:';
+            Get-ChildItem -Force -File -Recurse -Depth 1 | ForEach-Object { Write-Host '  ' $_.FullName };
+            if (Test-Path -Path './pjm-data') {
+              Write-Host 'pjm-data exists. Listing contents:';
+              Get-ChildItem -Path './pjm-data' -Recurse | ForEach-Object { Write-Host '  ' $_.FullName };
+            } else {
+              Write-Host 'pjm-data DOES NOT exist.';
+            }
+          "
 
       - name: Archive export
         if: always()
@@ -31,7 +44,6 @@ jobs:
           path: pjm-data/**
 
       - name: Upload via SFTP/SSH (OpenSSH scp)
-        # runtime guard inside script (vermijdt YAML parse issues)
         env:
           WP_SSH_HOST: ${{ secrets.WP_SSH_HOST }}
           WP_SSH_PORT: ${{ secrets.WP_SSH_PORT }}
@@ -41,23 +53,17 @@ jobs:
           WP_SSH_KNOWN_HOSTS: ${{ secrets.WP_SSH_KNOWN_HOSTS }}
         run: |
           pwsh -NoProfile -NoLogo -Command {
-            # Runtime guard: if no host configured, skip upload (avoids YAML-parsing issues)
             if (-not $env:WP_SSH_HOST -or $env:WP_SSH_HOST -eq '') {
-              Write-Host "WP_SSH_HOST is empty or not set — skipping upload step."
+              Write-Host "WP_SSH_HOST is empty — skipping upload."
               exit 0
             }
-
             if (-not $env:WP_SSH_PORT -or $env:WP_SSH_PORT -eq '') { $env:WP_SSH_PORT = '22' }
 
-            Write-Host "Preparing SSH key and known_hosts..."
             $keyFile = Join-Path $env:RUNNER_TEMP 'wp_ssh_key'
             Set-Content -Path $keyFile -Value $env:WP_SSH_KEY -NoNewline
-
-            # Restrict permissions on the key file (Windows)
             icacls $keyFile /inheritance:r | Out-Null
             icacls $keyFile /grant:r "$($env:USERNAME):R" | Out-Null
 
-            # Prepare optional known_hosts file (if provided)
             $knownHostsFile = Join-Path $env:RUNNER_TEMP 'known_hosts'
             $sshOptions = @()
             if ($env:WP_SSH_KNOWN_HOSTS -and $env:WP_SSH_KNOWN_HOSTS -ne '') {
@@ -67,42 +73,17 @@ jobs:
               $sshOptions += "-o"
               $sshOptions += "StrictHostKeyChecking=yes"
             } else {
-              # fallback: skip strict host checking (less secure)
               $sshOptions += "-o"
               $sshOptions += "StrictHostKeyChecking=no"
             }
 
-            Write-Host "Creating remote path (mkdir -p)..."
-            $mkdirCmd = @(
-              "ssh",
-              "-i", $keyFile,
-              "-p", $env:WP_SSH_PORT
-            ) + $sshOptions + @(
-              "$($env:WP_SSH_USER)@$($env:WP_SSH_HOST)",
-              "mkdir -p `"$($env:WP_TARGET_PATH)`""
-            )
-            Write-Host "SSH mkdir command: $($mkdirCmd -join ' ')"
-            $proc = Start-Process -FilePath $mkdirCmd[0] -ArgumentList $mkdirCmd[1..($mkdirCmd.Length-1)] -NoNewWindow -Wait -PassThru
-            if ($proc.ExitCode -ne 0) {
-              Write-Host "Remote mkdir command failed with exit code $($proc.ExitCode). Continuing to attempt upload..."
-            }
+            Write-Host "Creating remote path..."
+            $mkdirCmd = @("ssh","-i",$keyFile,"-p",$env:WP_SSH_PORT) + $sshOptions + @("$($env:WP_SSH_USER)@$($env:WP_SSH_HOST)","mkdir -p `"$($env:WP_TARGET_PATH)`"")
+            Start-Process -FilePath $mkdirCmd[0] -ArgumentList $mkdirCmd[1..($mkdirCmd.Length-1)] -NoNewWindow -Wait -PassThru
 
             Write-Host "Uploading files with scp..."
-            $scpCmd = @(
-              "scp",
-              "-i", $keyFile,
-              "-P", $env:WP_SSH_PORT
-            ) + $sshOptions + @(
-              "-r",
-              "pjm-data/*",
-              "$($env:WP_SSH_USER)@$($env:WP_SSH_HOST):`"$($env:WP_TARGET_PATH)/`""
-            )
-            Write-Host "SCP command: $($scpCmd -join ' ')"
+            $scpCmd = @("scp","-i",$keyFile,"-P",$env:WP_SSH_PORT) + $sshOptions + @("-r","pjm-data/*","$($env:WP_SSH_USER)@$($env:WP_SSH_HOST):`"$($env:WP_TARGET_PATH)/`"")
             $proc2 = Start-Process -FilePath $scpCmd[0] -ArgumentList $scpCmd[1..($scpCmd.Length-1)] -NoNewWindow -Wait -PassThru
-            if ($proc2.ExitCode -ne 0) {
-              Write-Error "SCP failed with exit code $($proc2.ExitCode)."
-              exit $proc2.ExitCode
-            } else {
-              Write-Host "Upload successful."
-            }
+            if ($proc2.ExitCode -ne 0) { Write-Error "SCP failed with exit code $($proc2.ExitCode)"; exit $proc2.ExitCode }
+            else { Write-Host "Upload successful." }
           }
