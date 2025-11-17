@@ -31,7 +31,7 @@ jobs:
           name: pjm-export
           path: pjm-data/**
 
-      - name: Upload via SFTP (WinSCP)
+      - name: Upload via SFTP/SSH (OpenSSH scp)
         if: ${{ secrets.WP_SSH_HOST != '' }}
         env:
           WP_SSH_HOST: ${{ secrets.WP_SSH_HOST }}
@@ -39,12 +39,66 @@ jobs:
           WP_SSH_USER: ${{ secrets.WP_SSH_USER }}
           WP_SSH_KEY: ${{ secrets.WP_SSH_KEY }}
           WP_TARGET_PATH: ${{ secrets.WP_TARGET_PATH }}
+          WP_SSH_KNOWN_HOSTS: ${{ secrets.WP_SSH_KNOWN_HOSTS }}
         run: |
-          $keyFile = "$env:RUNNER_TEMP\wp_ssh_key"
-          [System.IO.File]::WriteAllText($keyFile, $env:WP_SSH_KEY)
-          icacls $keyFile /inheritance:r
-          & "C:\Program Files (x86)\WinSCP\WinSCP.com" /command `
-            "open sftp://$env:WP_SSH_USER@$env:WP_SSH_HOST:$env:WP_SSH_PORT/ -privatekey=$keyFile -hostkey=* " `
-            "mkdir $env:WP_TARGET_PATH" `
-            "put -r pjm-data/* $env:WP_TARGET_PATH/" `
-            "exit"
+          pwsh -NoProfile -NoLogo -Command {
+            # Ensure we have a port
+            if (-not $env:WP_SSH_PORT -or $env:WP_SSH_PORT -eq '') { $env:WP_SSH_PORT = '22' }
+
+            Write-Host "Preparing SSH key and known_hosts..."
+            $keyFile = Join-Path $env:RUNNER_TEMP 'wp_ssh_key'
+            Set-Content -Path $keyFile -Value $env:WP_SSH_KEY -NoNewline
+
+            # Restrict permissions on the key file (Windows)
+            icacls $keyFile /inheritance:r | Out-Null
+            icacls $keyFile /grant:r "$($env:USERNAME):R" | Out-Null
+
+            # Prepare optional known_hosts file (if provided)
+            $knownHostsFile = Join-Path $env:RUNNER_TEMP 'known_hosts'
+            $sshOptions = @()
+            if ($env:WP_SSH_KNOWN_HOSTS -and $env:WP_SSH_KNOWN_HOSTS -ne '') {
+              Set-Content -Path $knownHostsFile -Value $env:WP_SSH_KNOWN_HOSTS -NoNewline
+              $sshOptions += "-o"
+              $sshOptions += "UserKnownHostsFile=`"$knownHostsFile`""
+              $sshOptions += "-o"
+              $sshOptions += "StrictHostKeyChecking=yes"
+            } else {
+              # fallback: skip strict host checking (less secure)
+              $sshOptions += "-o"
+              $sshOptions += "StrictHostKeyChecking=no"
+            }
+
+            Write-Host "Creating remote path (mkdir -p)..."
+            $mkdirCmd = @(
+              "ssh",
+              "-i", $keyFile,
+              "-p", $env:WP_SSH_PORT
+            ) + $sshOptions + @(
+              "$($env:WP_SSH_USER)@$($env:WP_SSH_HOST)",
+              "mkdir -p `"$($env:WP_TARGET_PATH)`""
+            )
+            Write-Host "SSH mkdir command: $($mkdirCmd -join ' ')"
+            $proc = Start-Process -FilePath $mkdirCmd[0] -ArgumentList $mkdirCmd[1..($mkdirCmd.Length-1)] -NoNewWindow -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+              Write-Host "Remote mkdir command failed with exit code $($proc.ExitCode). Continuing to attempt upload..."
+            }
+
+            Write-Host "Uploading files with scp..."
+            $scpCmd = @(
+              "scp",
+              "-i", $keyFile,
+              "-P", $env:WP_SSH_PORT
+            ) + $sshOptions + @(
+              "-r",
+              "pjm-data/*",
+              "$($env:WP_SSH_USER)@$($env:WP_SSH_HOST):`"$($env:WP_TARGET_PATH)/`""
+            )
+            Write-Host "SCP command: $($scpCmd -join ' ')"
+            $proc2 = Start-Process -FilePath $scpCmd[0] -ArgumentList $scpCmd[1..($scpCmd.Length-1)] -NoNewWindow -Wait -PassThru
+            if ($proc2.ExitCode -ne 0) {
+              Write-Error "SCP failed with exit code $($proc2.ExitCode)."
+              exit $proc2.ExitCode
+            } else {
+              Write-Host "Upload successful."
+            }
+          }
