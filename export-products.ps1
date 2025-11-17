@@ -1,36 +1,38 @@
 <#
-export-products.ps1
+Export-products.ps1
 
-PowerShell exporter for MSSQL (Azure SQL) using your semicolon-style connection string.
-
-Usage in workflow:
-  pwsh -NoProfile -NoLogo -File .\export-products.ps1
-Optional params:
-  -OutputDir 'pjm-data'    (default)
-  -MaxRows 10000           (default)
-  -IncludeThumbnail        (switch, include image as base64 / data-uri)
-
-Requires DB_CONNECTION_STRING secret set in the repository (your semicolon style string).
+- Leest jouw semicolon-style DB_CONNECTION_STRING uit env (Azure SQL).
+- Exporteert products naar pjm-data/products.json.
+- Schrijft thumbnails als losse bestanden in pjm-data/images/<ProductId>.<ext>.
+- Voegt in de JSON voor elk product ThumbnailPath = "images/<file>" (relatief tov pjm-data).
+- Usage in workflow / locally:
+    pwsh -NoProfile -NoLogo -File .\export-products.ps1 -OutputDir 'pjm-data' -MaxRows 10000
 #>
 
 param(
   [string]$OutputDir = 'pjm-data',
-  [int]$MaxRows = 10000,
-  [switch]$IncludeThumbnail
+  [int]$MaxRows = 10000
 )
 
-# Read connection string from environment
 $cs = $env:DB_CONNECTION_STRING
 if (-not $cs -or $cs.Trim() -eq '') {
-  Write-Error "DB_CONNECTION_STRING environment variable is not set. Add it to repository secrets."
+  Write-Error "DB_CONNECTION_STRING environment variable is not set."
   exit 1
 }
 
-Write-Host "Starting export-products.ps1 (IncludeThumbnail = $($IncludeThumbnail.IsPresent))"
+Write-Host "Exporting up to $MaxRows products to '$OutputDir'..."
 
-# Choose query depending on whether thumbnails are requested
-if ($IncludeThumbnail.IsPresent) {
-  $query = @"
+# Prepare output dirs
+if (-not (Test-Path -Path $OutputDir)) {
+  New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
+$imagesDir = Join-Path $OutputDir 'images'
+if (-not (Test-Path -Path $imagesDir)) {
+  New-Item -ItemType Directory -Path $imagesDir -Force | Out-Null
+}
+
+# Query
+$query = @"
 SELECT TOP ($MaxRows)
   [ProductId],
   [CategoryId],
@@ -46,23 +48,6 @@ SELECT TOP ($MaxRows)
 FROM [catalog].[Products]
 ORDER BY [ProductId];
 "@
-} else {
-  $query = @"
-SELECT TOP ($MaxRows)
-  [ProductId],
-  [CategoryId],
-  [SKU],
-  [Name],
-  [Description],
-  [Price],
-  [IsActive],
-  [CreatedAt],
-  [ThumbnailContentType],
-  [ThumbnailUpdatedAt]
-FROM [catalog].[Products]
-ORDER BY [ProductId];
-"@
-}
 
 try {
   Add-Type -AssemblyName System.Data
@@ -86,66 +71,65 @@ try {
   exit 1
 }
 
-$rows = New-Object System.Collections.ArrayList
+$rows = @()
+
+function Get-ExtensionFromContentType($ct) {
+  switch ($ct) {
+    'image/png' { return '.png' }
+    'image/jpeg' { return '.jpg' }
+    'image/jpg' { return '.jpg' }
+    'image/webp' { return '.webp' }
+    'image/gif' { return '.gif' }
+    default { return '.bin' }
+  }
+}
 
 foreach ($r in $dt.Rows) {
   $obj = @{}
   foreach ($c in $dt.Columns) {
     $name = $c.ColumnName
     $val = $r[$name]
-
-    # Convert DB NULL to $null
     if ($val -eq [System.DBNull]::Value) {
       $obj[$name] = $null
       continue
     }
 
-    # If thumbnail column present and is byte[] -> handle below (skip raw bytes for JSON)
+    # Save thumbnail bytes as files, and don't include raw byte[] in JSON
     if ($name -eq 'Thumbnail' -and $val -is [byte[]]) {
-      # store temporarily as byte[]; we'll convert below after we have content-type
-      $obj['_ThumbnailBytes'] = $val
+      $bytes = $val
+      $ct = $r['ThumbnailContentType']
+      $ext = Get-ExtensionFromContentType $ct
+      $fname = "{0}{1}" -f $r['ProductId'], $ext
+      $fullPath = Join-Path $imagesDir $fname
+      try {
+        [System.IO.File]::WriteAllBytes($fullPath, $bytes)
+        # store relative path into JSON object
+        $obj['ThumbnailPath'] = "images/$fname"
+        # keep content type too
+        if ($ct) { $obj['ThumbnailContentType'] = $ct }
+      } catch {
+        Write-Warning "Failed to write thumbnail for ProductId $($r['ProductId']): $($_.Exception.Message)"
+      }
       continue
     }
 
-    # Default assignment
+    # Default assignment for other columns
     $obj[$name] = $val
   }
 
-  # If we captured thumbnail bytes convert to base64 and optionally data-uri
-  if ($obj.ContainsKey('_ThumbnailBytes')) {
-    $bytes = $obj['_ThumbnailBytes']
-    $b64 = [System.Convert]::ToBase64String($bytes)
-    $obj.Remove('_ThumbnailBytes') > $null
-    # Add base64 field
-    $obj['ThumbnailBase64'] = $b64
-    # If content type present, add data-uri
-    if ($obj.ContainsKey('ThumbnailContentType') -and $obj['ThumbnailContentType']) {
-      $ct = $obj['ThumbnailContentType']
-      $obj['ThumbnailDataUri'] = "data:$ct;base64,$b64"
-    }
-    # Optionally remove raw Thumbnail column if present (we replaced it)
-    if ($obj.ContainsKey('Thumbnail')) { $obj.Remove('Thumbnail') > $null }
-  }
-
-  $rows.Add((New-Object PSObject -Property $obj)) | Out-Null
+  $rows += $obj
 }
 
-# Ensure output dir exists
-if (-not (Test-Path -Path $OutputDir)) {
-  New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-}
-
+# Write JSON to file (pretty printed)
 $outFile = Join-Path $OutputDir 'products.json'
-
 try {
-  # Convert to JSON pretty with sufficient depth
   $json = $rows | ConvertTo-Json -Depth 6
-  # Write file as UTF8 (no BOM)
+  # Write UTF8 (BOM may be present on some runners; importer handles BOM)
   [System.IO.File]::WriteAllText($outFile, $json, [System.Text.Encoding]::UTF8)
+  Write-Host "Wrote $($rows.Count) products to $outFile"
 } catch {
   Write-Error "Failed to write JSON: $($_.Exception.Message)"
   exit 1
 }
 
-Write-Host "Wrote $($rows.Count) products to $outFile"
 exit 0
