@@ -10,7 +10,7 @@
  * Move this file outside public_html after testing and update REMOTE_IMPORT_PATH in the workflow.
  */
 
-$EXPECTED_TOKEN = 'REPLACE_WITH_A_LONG_RANDOM_SECRET'; // <-- set your token
+$EXPECTED_TOKEN = 'a8f3c2b9d6e14f3b9a1c2d3e4f5a6b7c'; // <-- set your token
 
 // Accept token from CLI (--token=...) or from GET (web)
 $token = '';
