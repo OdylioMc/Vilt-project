@@ -32,7 +32,7 @@ jobs:
           path: pjm-data/**
 
       - name: Upload via SFTP/SSH (OpenSSH scp)
-        if: ${{ secrets.WP_SSH_HOST != '' }}
+        # We removed the YAML-level if and do a runtime guard inside the script below
         env:
           WP_SSH_HOST: ${{ secrets.WP_SSH_HOST }}
           WP_SSH_PORT: ${{ secrets.WP_SSH_PORT }}
@@ -42,7 +42,12 @@ jobs:
           WP_SSH_KNOWN_HOSTS: ${{ secrets.WP_SSH_KNOWN_HOSTS }}
         run: |
           pwsh -NoProfile -NoLogo -Command {
-            # Ensure we have a port
+            # Runtime guard: if no host configured, skip upload (avoids YAML-parsing issues)
+            if (-not $env:WP_SSH_HOST -or $env:WP_SSH_HOST -eq '') {
+              Write-Host "WP_SSH_HOST is empty or not set — skipping upload step."
+              exit 0
+            }
+
             if (-not $env:WP_SSH_PORT -or $env:WP_SSH_PORT -eq '') { $env:WP_SSH_PORT = '22' }
 
             Write-Host "Preparing SSH key and known_hosts..."
