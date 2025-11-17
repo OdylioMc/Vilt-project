@@ -15,26 +15,38 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Run export script
+      - name: Run export script (verify files then execute)
         env:
           DB_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING }}
+        shell: pwsh
         run: |
-          pwsh -NoProfile -NonInteractive -File .\export-products.ps1 -OutputDir 'pjm-data' -ColumnsConfig '.\columns.json'
+          Write-Host "=== LIST REPOSITORY ROOT (top levels) ==="
+          Get-ChildItem -Force -File -Depth 2 | ForEach-Object { Write-Host '  ' $_.FullName }
+
+          Write-Host "=== CHECK FOR export-products.ps1 ==="
+          if (Test-Path -Path .\export-products.ps1) {
+            Write-Host "Found export-products.ps1 - executing..."
+            & .\export-products.ps1 -OutputDir 'pjm-data' -ColumnsConfig '.\columns.json'
+            $exit = $LASTEXITCODE
+            Write-Host "EXPORT SCRIPT EXIT CODE: $exit"
+            if ($exit -ne 0) { exit $exit }
+          } else {
+            Write-Error "export-products.ps1 NOT FOUND in repository workspace root. Aborting."
+            exit 1
+          }
 
       - name: "Debug: show working dir and list pjm-data"
-        # laat zien waar we zitten en wat er in pjm-data staat
+        shell: pwsh
         run: |
-          pwsh -NoProfile -NoLogo -Command "
-            Write-Host 'Current directory:' (Get-Location).Path;
-            Write-Host 'Repository root listing:';
-            Get-ChildItem -Force -File -Recurse -Depth 1 | ForEach-Object { Write-Host '  ' $_.FullName };
-            if (Test-Path -Path './pjm-data') {
-              Write-Host 'pjm-data exists. Listing contents:';
-              Get-ChildItem -Path './pjm-data' -Recurse | ForEach-Object { Write-Host '  ' $_.FullName };
-            } else {
-              Write-Host 'pjm-data DOES NOT exist.';
-            }
-          "
+          Write-Host 'Current directory:' (Get-Location).Path
+          Write-Host 'Repository root listing:'
+          Get-ChildItem -Force -File -Recurse -Depth 1 | ForEach-Object { Write-Host '  ' $_.FullName }
+          if (Test-Path -Path './pjm-data') {
+            Write-Host 'pjm-data exists. Listing contents:'
+            Get-ChildItem -Path './pjm-data' -Recurse | ForEach-Object { Write-Host '  ' $_.FullName }
+          } else {
+            Write-Host 'pjm-data DOES NOT exist.'
+          }
 
       - name: Archive export
         if: always()
@@ -49,8 +61,10 @@ jobs:
           WP_SSH_PORT: ${{ secrets.WP_SSH_PORT }}
           WP_SSH_USER: ${{ secrets.WP_SSH_USER }}
           WP_SSH_KEY: ${{ secrets.WP_SSH_KEY }}
+          WP_SSH_KEY_B64: ${{ secrets.WP_SSH_KEY_B64 }}
           WP_TARGET_PATH: ${{ secrets.WP_TARGET_PATH }}
           WP_SSH_KNOWN_HOSTS: ${{ secrets.WP_SSH_KNOWN_HOSTS }}
+        shell: pwsh
         run: |
           pwsh -NoProfile -NoLogo -Command {
             if (-not $env:WP_SSH_HOST -or $env:WP_SSH_HOST -eq '') {
@@ -60,10 +74,30 @@ jobs:
             if (-not $env:WP_SSH_PORT -or $env:WP_SSH_PORT -eq '') { $env:WP_SSH_PORT = '22' }
 
             $keyFile = Join-Path $env:RUNNER_TEMP 'wp_ssh_key'
-            Set-Content -Path $keyFile -Value $env:WP_SSH_KEY -NoNewline
+
+            if ($env:WP_SSH_KEY_B64 -and $env:WP_SSH_KEY_B64 -ne '') {
+              Write-Host "Decoding base64 SSH key to $keyFile"
+              try {
+                $bytes = [System.Convert]::FromBase64String($env:WP_SSH_KEY_B64)
+                [System.IO.File]::WriteAllBytes($keyFile, $bytes)
+              } catch {
+                Write-Error "Failed to decode WP_SSH_KEY_B64: $_"
+                exit 1
+              }
+            } elseif ($env:WP_SSH_KEY -and $env:WP_SSH_KEY -ne '') {
+              Write-Host "Writing plain-text SSH key to $keyFile (ensure secret uses real newlines)"
+              $textBytes = [System.Text.Encoding]::UTF8.GetBytes($env:WP_SSH_KEY)
+              [System.IO.File]::WriteAllBytes($keyFile, $textBytes)
+            } else {
+              Write-Error "No SSH key secret provided. Set WP_SSH_KEY_B64 (preferred) or WP_SSH_KEY."
+              exit 1
+            }
+
+            # Restrict permissions on the key file (Windows)
             icacls $keyFile /inheritance:r | Out-Null
             icacls $keyFile /grant:r "$($env:USERNAME):R" | Out-Null
 
+            # Prepare known_hosts if provided
             $knownHostsFile = Join-Path $env:RUNNER_TEMP 'known_hosts'
             $sshOptions = @()
             if ($env:WP_SSH_KNOWN_HOSTS -and $env:WP_SSH_KNOWN_HOSTS -ne '') {
@@ -79,11 +113,15 @@ jobs:
 
             Write-Host "Creating remote path..."
             $mkdirCmd = @("ssh","-i",$keyFile,"-p",$env:WP_SSH_PORT) + $sshOptions + @("$($env:WP_SSH_USER)@$($env:WP_SSH_HOST)","mkdir -p `"$($env:WP_TARGET_PATH)`"")
-            Start-Process -FilePath $mkdirCmd[0] -ArgumentList $mkdirCmd[1..($mkdirCmd.Length-1)] -NoNewWindow -Wait -PassThru
+            Write-Host "SSH mkdir command: $($mkdirCmd -join ' ')"
+            $proc = Start-Process -FilePath $mkdirCmd[0] -ArgumentList $mkdirCmd[1..($mkdirCmd.Length-1)] -NoNewWindow -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+              Write-Host "Remote mkdir command failed with exit code $($proc.ExitCode). Continuing to attempt upload..."
+            }
 
             Write-Host "Uploading files with scp..."
             $scpCmd = @("scp","-i",$keyFile,"-P",$env:WP_SSH_PORT) + $sshOptions + @("-r","pjm-data/*","$($env:WP_SSH_USER)@$($env:WP_SSH_HOST):`"$($env:WP_TARGET_PATH)/`"")
+            Write-Host "SCP command: $($scpCmd -join ' ')"
             $proc2 = Start-Process -FilePath $scpCmd[0] -ArgumentList $scpCmd[1..($scpCmd.Length-1)] -NoNewWindow -Wait -PassThru
-            if ($proc2.ExitCode -ne 0) { Write-Error "SCP failed with exit code $($proc2.ExitCode)"; exit $proc2.ExitCode }
-            else { Write-Host "Upload successful." }
+            if ($proc2.ExitCode -ne 0) { Write-Error "SCP failed with exit code $($proc2.ExitCode)"; exit $proc2.ExitCode } else { Write-Host "Upload successful." }
           }
