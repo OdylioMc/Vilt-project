@@ -21,7 +21,7 @@ jobs:
         run: |
           pwsh -NoProfile -NonInteractive -File ./export-products.ps1 -OutputDir 'pjm-data' -ColumnsConfig './columns.json'
 
-      - name: Debug: show working dir and list pjmdat a
+      - name: "Debug: show working dir and list pjm-data"
         # laat zien waar we zitten en wat er in pjm-data staat
         run: |
           pwsh -NoProfile -NoLogo -Command "
