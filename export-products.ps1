@@ -1,89 +1,88 @@
-<?php
-/**
- * export-products.php
- *
- * Simple CLI exporter: reads DB_CONNECTION_STRING from env, runs a query and writes JSON to pjm-data/products.json
- *
- * Usage (in GitHub Actions): php ./export-products.php
- *
- * DB_CONNECTION_STRING format (example):
- *   mysql://dbuser:secret@db-host.example.com:3306/mydatabase
- *
- * Edit $query below to match your actual products table and columns.
- */
+<#
+Simple PowerShell exporter for MSSQL (Azure SQL).
 
-$dsnEnv = getenv('DB_CONNECTION_STRING');
+Usage in workflow (Windows runner):
+  pwsh -NoProfile -NoLogo -File .\export-products.ps1
 
-if (!$dsnEnv) {
-    fwrite(STDERR, "ERROR: DB_CONNECTION_STRING environment variable is not set.\n");
-    exit(1);
+It reads DB_CONNECTION_STRING from env (your semicolon-style connection string),
+runs a query and writes pjm-data\products.json.
+
+Adjust $query below to match your schema (table and column names).
+#>
+
+param(
+  [string]$OutputDir = 'pjm-data',
+  [int]$MaxRows = 10000
+)
+
+# Read connection string from environment (set as repo secret DB_CONNECTION_STRING)
+$cs = $env:DB_CONNECTION_STRING
+if (-not $cs -or $cs.Trim() -eq '') {
+  Write-Error "DB_CONNECTION_STRING environment variable is not set. Please add it to repository secrets."
+  exit 1
 }
 
-// Parse a DSN like: mysql://user:pass@host:port/dbname
-$parts = parse_url($dsnEnv);
-if ($parts === false || !isset($parts['scheme']) || $parts['scheme'] !== 'mysql') {
-    fwrite(STDERR, "ERROR: DB_CONNECTION_STRING has wrong format. Expected mysql://user:pass@host:port/dbname\n");
-    exit(1);
-}
-
-$user = $parts['user'] ?? '';
-$pass = $parts['pass'] ?? '';
-$host = $parts['host'] ?? '127.0.0.1';
-$port = $parts['port'] ?? 3306;
-$dbname = ltrim($parts['path'] ?? '', '/');
-
-if (!$dbname) {
-    fwrite(STDERR, "ERROR: database name missing in DB_CONNECTION_STRING\n");
-    exit(1);
-}
-
-// Configure DSN for PDO
-$pdoDsn = "mysql:host={$host};port={$port};dbname={$dbname};charset=utf8mb4";
+Write-Host "Using DB connection string (masked):" ($cs.Substring(0, [Math]::Min(30, $cs.Length)) + '...')
+# ====== ADAPT THIS QUERY TO YOUR DATABASE ======
+# Replace table/column names with your real product table
+# Example (change to your actual schema):
+$query = @"
+SELECT TOP ($MaxRows) id, title, price
+FROM products
+ORDER BY id
+"@
+# ===============================================
 
 try {
-    $pdo = new PDO($pdoDsn, $user, $pass, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
-    ]);
-} catch (Exception $ex) {
-    fwrite(STDERR, "ERROR: could not connect to database: " . $ex->getMessage() . "\n");
-    exit(1);
+  Add-Type -AssemblyName System.Data
+  $conn = New-Object System.Data.SqlClient.SqlConnection $cs
+  $cmd = $conn.CreateCommand()
+  $cmd.CommandText = $query
+  $conn.Open()
+  $reader = $cmd.ExecuteReader()
+} catch {
+  Write-Error "Failed to connect or execute query: $($_.Exception.Message)"
+  exit 1
 }
 
-// ====== ADAPT THIS QUERY TO YOUR SCHEMA ======
-// Example: select id, title, price from your products table
-// If your product table is wp_posts + meta or WooCommerce, you will need to join wp_postmeta or use WooCommerce REST API instead.
-$query = "SELECT id, title, price FROM products LIMIT 10000";
-// ============================================
-
+# Load data into DataTable
+$dt = New-Object System.Data.DataTable
 try {
-    $stmt = $pdo->query($query);
-    $rows = $stmt->fetchAll();
-} catch (Exception $ex) {
-    fwrite(STDERR, "ERROR: query failed: " . $ex->getMessage() . "\n");
-    exit(1);
+  $dt.Load($reader) | Out-Null
+  $reader.Close()
+  $conn.Close()
+} catch {
+  Write-Error "Error reading results: $($_.Exception.Message)"
+  exit 1
 }
 
-$outputDir = 'pjm-data';
-if (!is_dir($outputDir)) {
-    if (!mkdir($outputDir, 0775, true)) {
-        fwrite(STDERR, "ERROR: failed to create output directory: {$outputDir}\n");
-        exit(1);
-    }
+# Convert DataTable rows to array of PSObjects for nicer JSON
+$rows = @()
+foreach ($r in $dt.Rows) {
+  $obj = @{}
+  foreach ($c in $dt.Columns) {
+    $name = $c.ColumnName
+    $obj[$name] = $r[$name]
+  }
+  $rows += (New-Object PSObject -Property $obj)
 }
 
-$outFile = $outputDir . DIRECTORY_SEPARATOR . 'products.json';
-$json = json_encode($rows, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-if ($json === false) {
-    fwrite(STDERR, "ERROR: failed to encode JSON\n");
-    exit(1);
+# Ensure output dir exists
+if (-not (Test-Path -Path $OutputDir)) {
+  New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 }
 
-if (file_put_contents($outFile, $json) === false) {
-    fwrite(STDERR, "ERROR: failed to write file: {$outFile}\n");
-    exit(1);
+$outFile = Join-Path $OutputDir 'products.json'
+
+# Convert to JSON (pretty)
+try {
+  $json = $rows | ConvertTo-Json -Depth 5 -Compress:$false
+  # Write with UTF8
+  Set-Content -Path $outFile -Value $json -Encoding UTF8
+} catch {
+  Write-Error "Failed to write JSON: $($_.Exception.Message)"
+  exit 1
 }
 
-echo "Wrote " . count($rows) . " products to {$outFile}\n";
-exit(0);
+Write-Host "Wrote $($rows.Count) products to $outFile"
+exit 0
