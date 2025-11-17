@@ -4,8 +4,8 @@ param(
 )
 
 Write-Host "Starting export-products.ps1"
-Write-Host "OutputDir: $OutputDir"
-Write-Host "ColumnsConfig: $ColumnsConfig"
+Write-Host "OutputDir: ${OutputDir}"
+Write-Host "ColumnsConfig: ${ColumnsConfig}"
 
 # Optioneel: toon of DB_CONNECTION_STRING aanwezig is (NIET de waarde loggen in productie)
 if ($env:DB_CONNECTION_STRING) {
@@ -31,7 +31,7 @@ if (Test-Path -Path $ColumnsConfig) {
   Copy-Item -Path $ColumnsConfig -Destination (Join-Path $OutputDir (Split-Path $ColumnsConfig -Leaf)) -Force
 }
 
-Write-Host "Export complete. Files in $OutputDir:"
+Write-Host "Export complete. Files in ${OutputDir}:"
 Get-ChildItem -Path $OutputDir -Recurse | ForEach-Object { Write-Host "  " $_.FullName }
 
 # Succes exitcode
