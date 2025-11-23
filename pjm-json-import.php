@@ -1,18 +1,23 @@
 <?php
 /**
- * pjM JSON importer — local files support
+ * pjM JSON importer — simplified (no ParentId)
  *
- * - Supports ThumbnailPath in products.json: reads file from wp_get_upload_dir()['basedir'] . '/pjm-data/' . ThumbnailPath
- * - Creates media attachments and sets as featured image.
- * - Supports CLI (--token=...) and web ?token=...
+ * - Does NOT expect ParentId/ParentProductId in JSON
+ * - Matches by SKU first (updates product or variation)
+ * - If no SKU found: finds parent by _pjm_product_id and:
+ *     - if parent is variable and Afmeting given -> match variation by attribute and update it
+ *     - else update/create the parent product
+ * - Thumbnail handling unchanged
  *
- * IMPORTANT: set $EXPECTED_TOKEN to a long secret before running.
- * Move this file outside public_html after testing and update REMOTE_IMPORT_PATH in the workflow.
+ * Usage (CLI):
+ *   PJM_TOKEN=yourtoken php pj m-json-import.php
+ *
+ * IMPORTANT: place outside public_html and protect token.
  */
 
-$EXPECTED_TOKEN = 'a8f3c2b9d6e14f3b9a1c2d3e4f5a6b7c'; // <-- set your token
+$EXPECTED_TOKEN = getenv('PJM_TOKEN') ?: 'a8f3c2b9d6e14f3b9a1c2d3e4f5a6b7c'; // prefer env var
 
-// Accept token from CLI (--token=...) or from GET (web)
+// Accept token from CLI (--token=...) or from GET (web) or env
 $token = '';
 if (PHP_SAPI === 'cli') {
     foreach ($argv as $a) {
@@ -21,8 +26,9 @@ if (PHP_SAPI === 'cli') {
             break;
         }
     }
+    if (empty($token)) $token = getenv('PJM_TOKEN') ?: '';
 } else {
-    $token = isset($_GET['token']) ? $_GET['token'] : '';
+    $token = isset($_GET['token']) ? $_GET['token'] : (getenv('PJM_TOKEN') ?: '');
 }
 
 if ($token !== $EXPECTED_TOKEN) {
@@ -35,7 +41,7 @@ if ($token !== $EXPECTED_TOKEN) {
     exit(1);
 }
 
-// Find wp-load.php and bootstrap WP
+// bootstrap WP
 $wp_load = __DIR__ . '/../../wp-load.php';
 if (!file_exists($wp_load)) {
     $wp_load_alt = __DIR__ . '/../wp-load.php';
@@ -80,7 +86,7 @@ if ($data === null && json_last_error() !== JSON_ERROR_NONE) {
     exit(1);
 }
 
-// helper: find existing WP post by mapping meta _pjm_product_id
+// helper: find post by _pjm_product_id
 function find_post_by_pjm_id($pjmId) {
     $args = [
         'post_type' => function_exists('wc_get_product') ? 'product' : 'post',
@@ -94,7 +100,7 @@ function find_post_by_pjm_id($pjmId) {
     return false;
 }
 
-// helper: import media from a local file inside uploads/pjm-data/
+// media helpers (unchanged)
 function media_from_localfile($relativePath, $filenamePrefix = 'pjm_thumb_') {
     $upload_dir = wp_get_upload_dir();
     $full = trailingslashit($upload_dir['basedir']) . 'pjm-data/' . ltrim($relativePath, '/');
@@ -118,8 +124,6 @@ function media_from_localfile($relativePath, $filenamePrefix = 'pjm_thumb_') {
     wp_update_attachment_metadata( $attach_id, $attach_data );
     return $attach_id;
 }
-
-// existing base64 handler (kept) — in case you ever embed base64/data-uri
 function media_from_base64($dataUri, $filenamePrefix = 'pjm_thumb_') {
     if (preg_match('#^data:(.+?);base64,(.+)$#', $dataUri, $m)) {
         $mime = $m[1];
@@ -132,17 +136,14 @@ function media_from_base64($dataUri, $filenamePrefix = 'pjm_thumb_') {
     }
     $binary = base64_decode($b64);
     if ($binary === false) return 0;
-
     $ext = '.bin';
     if ($mime === 'image/jpeg' || $mime === 'image/jpg') $ext = '.jpg';
     elseif ($mime === 'image/png') $ext = '.png';
     elseif ($mime === 'image/gif') $ext = '.gif';
-
     $time = time();
     $filename = $filenamePrefix . $time . $ext;
     $upload = wp_upload_bits($filename, null, $binary);
     if ($upload['error']) return 0;
-
     $filetype = wp_check_filetype( $upload['file'], null );
     $attachment = [
         'post_mime_type' => $filetype['type'],
@@ -157,29 +158,17 @@ function media_from_base64($dataUri, $filenamePrefix = 'pjm_thumb_') {
     return $attach_id;
 }
 
-/**
- * Update price helper
- *
- * Tries to:
- *  - find product/variation by SKU and update that product's price
- *  - if not found and $post_id supplied, update all variations of the parent product
- *  - fallback to updating parent product price
- *
- * Uses WooCommerce CRUD if available to keep lookup tables in sync.
- */
+// price helper (same as before)
 function update_price_for_sku_or_variations( $sku, $price, $post_id = 0 ) {
     $price_clean = number_format( (float) $price, 2, '.', '' );
 
     if ( function_exists( 'wc_get_product' ) ) {
-        // 1) Try SKU (works for both variations and parent products)
         if ( ! empty( $sku ) ) {
             $found_id = wc_get_product_id_by_sku( $sku );
             if ( $found_id ) {
                 $product = wc_get_product( $found_id );
                 if ( $product ) {
                     $product->set_regular_price( $price_clean );
-                    // optional: set_price too
-                    // $product->set_price( $price_clean );
                     $product->save();
                     update_post_meta( $found_id, '_regular_price', (string) $price_clean );
                     update_post_meta( $found_id, '_price', (string) $price_clean );
@@ -191,7 +180,6 @@ function update_price_for_sku_or_variations( $sku, $price, $post_id = 0 ) {
             }
         }
 
-        // 2) If parent post id provided: update all variations
         if ( $post_id ) {
             $args = [
                 'post_type'      => 'product_variation',
@@ -206,7 +194,6 @@ function update_price_for_sku_or_variations( $sku, $price, $post_id = 0 ) {
                     $vp = wc_get_product( $vid );
                     if ( $vp ) {
                         $vp->set_regular_price( $price_clean );
-                        // $vp->set_price( $price_clean );
                         $vp->save();
                         update_post_meta( $vid, '_regular_price', (string) $price_clean );
                         update_post_meta( $vid, '_price', (string) $price_clean );
@@ -219,12 +206,10 @@ function update_price_for_sku_or_variations( $sku, $price, $post_id = 0 ) {
             }
         }
 
-        // 3) Fallback: update parent
         if ( $post_id ) {
             $parent = wc_get_product( $post_id );
             if ( $parent ) {
                 $parent->set_regular_price( $price_clean );
-                // $parent->set_price( $price_clean );
                 $parent->save();
             } else {
                 update_post_meta( $post_id, '_regular_price', (string) $price_clean );
@@ -235,7 +220,6 @@ function update_price_for_sku_or_variations( $sku, $price, $post_id = 0 ) {
 
         return false;
     } else {
-        // No WooCommerce: fallback to postmeta on parent
         if ( $post_id ) {
             update_post_meta( $post_id, '_regular_price', (string) $price_clean );
             update_post_meta( $post_id, '_price', (string) $price_clean );
@@ -245,23 +229,17 @@ function update_price_for_sku_or_variations( $sku, $price, $post_id = 0 ) {
     }
 }
 
-/**
- * Set SKU on a product (prefer WC CRUD). If the SKU maps to a different product (variation),
- * that product will be updated via update_price_for_sku_or_variations when price runs.
- */
 function set_product_sku( $post_id, $sku ) {
     if ( empty( $sku ) || ! $post_id ) return false;
     if ( function_exists( 'wc_get_product' ) ) {
         $p = wc_get_product( $post_id );
         if ( $p ) {
-            // Only set SKU if empty or differs (avoid accidental overwrite of variation SKU)
             $current = $p->get_sku();
             if ( $current !== $sku ) {
                 try {
                     $p->set_sku( $sku );
                     $p->save();
                 } catch ( Exception $e ) {
-                    // fallback to postmeta if set_sku fails (unique constraint, etc.)
                     update_post_meta( $post_id, '_sku', $sku );
                     return true;
                 }
@@ -273,7 +251,66 @@ function set_product_sku( $post_id, $sku ) {
     return true;
 }
 
-// Loop items and create/update posts
+// find variation by attribute (pa_afmeting or fallback to custom attribute)
+function find_variation_by_attribute( $parent_id, $attr_value ) {
+    if ( empty( $parent_id ) || empty( $attr_value ) ) return false;
+    $args = [
+        'post_type'      => 'product_variation',
+        'post_parent'    => $parent_id,
+        'posts_per_page' => -1,
+        'post_status'    => array( 'publish','private' ),
+        'fields'         => 'ids'
+    ];
+    $vars = get_posts( $args );
+    foreach ( $vars as $vid ) {
+        $v = wc_get_product( $vid );
+        if ( ! $v ) continue;
+        $vAttr = $v->get_attribute( 'pa_afmeting' );
+        if ( empty( $vAttr ) ) {
+            $atts = $v->get_attributes();
+            foreach ( $atts as $k => $a ) {
+                if ( is_string( $k ) ) {
+                    $val = $v->get_attribute( $k );
+                    if ( ! empty( $val ) && strcasecmp( trim( $val ), trim( $attr_value ) ) === 0 ) {
+                        return $vid;
+                    }
+                }
+            }
+        } else {
+            if ( strcasecmp( trim($vAttr), trim($attr_value) ) === 0 ) {
+                return $vid;
+            }
+        }
+    }
+    return false;
+}
+
+// create variation helper (keeps attribute key attribute_pa_afmeting)
+function create_variation_with_attribute( $parent_id, $attr_value, $sku = '', $price = null ) {
+    $variation = new WC_Product_Variation();
+    $variation->set_parent_id( $parent_id );
+    if ( $sku ) {
+        try { $variation->set_sku( $sku ); } catch ( Exception $e ) { /* ignore */ }
+    }
+    $vid = $variation->save();
+    if ( ! $vid ) return 0;
+    update_post_meta( $vid, 'attribute_pa_afmeting', $attr_value );
+    if ( $price !== null && $price !== '' ) {
+        $price_clean = number_format( (float) $price, 2, '.', '' );
+        $vobj = wc_get_product( $vid );
+        if ( $vobj ) {
+            $vobj->set_regular_price($price_clean);
+            $vobj->set_price($price_clean);
+            $vobj->save();
+        } else {
+            update_post_meta($vid, '_regular_price', (string)$price_clean);
+            update_post_meta($vid, '_price', (string)$price_clean);
+        }
+    }
+    return $vid;
+}
+
+// Loop items and create/update posts/variations
 $created = 0;
 $updated = 0;
 $errors = [];
@@ -284,66 +321,95 @@ foreach ($data as $item) {
 
     $title = $item['Name'] ?? $item['name'] ?? 'No title';
     $content = $item['Description'] ?? $item['description'] ?? '';
-    $price = isset($item['Price']) ? $item['Price'] : null;
+    $price = array_key_exists('Price',$item) ? $item['Price'] : (isset($item['price']) ? $item['price'] : null);
     $isActive = isset($item['IsActive']) ? (bool)$item['IsActive'] : true;
     $sku = isset($item['SKU']) ? trim($item['SKU']) : '';
+    $afmeting = isset($item['Afmeting']) ? trim($item['Afmeting']) : (isset($item['afmeting']) ? trim($item['afmeting']) : '');
 
-    $post_id = find_post_by_pjm_id($pjmId);
-
-    if ($post_id) {
-        $postarr = [
-            'ID' => $post_id,
-            'post_title' => wp_strip_all_tags($title),
-            'post_content' => $content,
-            'post_status' => $isActive ? 'publish' : 'draft',
-        ];
-        wp_update_post($postarr);
-
-        // ensure WP meta _pjm_product_id exists
-        update_post_meta($post_id, '_pjm_product_id', (string)$pjmId);
-
-        // set SKU if present
-        if (!empty($sku)) {
-            set_product_sku( $post_id, $sku );
-        }
-
-        // set price using robust helper (will update variation if SKU matches or all variations)
-        if ($price !== null) {
-            update_price_for_sku_or_variations( $sku, $price, $post_id );
-        } else {
-            // no price in JSON - leave as is or set to empty if desired
-        }
-
-        $updated++;
-        $new_post_id = $post_id;
-    } else {
-        $postarr = [
-            'post_title' => wp_strip_all_tags($title),
-            'post_content' => $content,
-            'post_status' => $isActive ? 'publish' : 'draft',
-            'post_type' => function_exists('wc_get_product') ? 'product' : 'post'
-        ];
-        $new_id = wp_insert_post($postarr);
-        if (is_wp_error($new_id) || !$new_id) { $errors[] = "Failed to insert product $pjmId ($title)"; continue; }
-
-        // ensure WP meta _pjm_product_id exists
-        update_post_meta($new_id, '_pjm_product_id', (string)$pjmId);
-
-        // set SKU if present
-        if (!empty($sku)) {
-            set_product_sku( $new_id, $sku );
-        }
-
-        // set price using robust helper
-        if ($price !== null) {
-            update_price_for_sku_or_variations( $sku, $price, $new_id );
-        }
-
-        $created++;
-        $new_post_id = $new_id;
+    // 1) Prefer SKU matching (works for parent or variation)
+    $sku_target_id = '';
+    if (!empty($sku) && function_exists('wc_get_product_id_by_sku')) {
+        $sku_target_id = wc_get_product_id_by_sku($sku);
     }
 
-    // thumbnail handling: prefer local file path if present
+    if ($sku_target_id) {
+        // Update the SKU target product/variation
+        if ($price !== null) update_price_for_sku_or_variations($sku, $price, 0);
+        // Ensure _pjm_product_id is set on the parent mapping for this pjmid (if appropriate)
+        $updated++;
+        $new_post_id = $sku_target_id;
+    } else {
+        // 2) No SKU found — find parent by _pjm_product_id
+        $post_id = find_post_by_pjm_id($pjmId);
+
+        if ($post_id) {
+            // If parent is variable and afmeting provided, try to find/update variation by attribute
+            $parent_product = function_exists('wc_get_product') ? wc_get_product($post_id) : null;
+            $is_variable = ($parent_product && $parent_product->get_type() === 'variable');
+
+            if ($is_variable && !empty($afmeting)) {
+                $var_id = find_variation_by_attribute($post_id, $afmeting);
+                if ($var_id) {
+                    if ($price !== null) {
+                        $vobj = wc_get_product($var_id);
+                        if ($vobj) {
+                            $price_clean = number_format( (float) $price, 2, '.', '' );
+                            $vobj->set_regular_price($price_clean);
+                            $vobj->set_price($price_clean);
+                            $vobj->save();
+                            update_post_meta($var_id, '_regular_price', (string)$price_clean);
+                            update_post_meta($var_id, '_price', (string)$price_clean);
+                            if (function_exists('wc_delete_product_transients')) wc_delete_product_transients($var_id);
+                        }
+                    }
+                    if (!empty($sku)) set_product_sku($var_id, $sku);
+                    $updated++;
+                    $new_post_id = $var_id;
+                } else {
+                    // variation not found: create it under parent
+                    $created_var_id = create_variation_with_attribute($post_id, $afmeting, $sku, $price);
+                    if ($created_var_id) {
+                        $created++;
+                        $new_post_id = $created_var_id;
+                    } else {
+                        $errors[] = "Failed to create variation for parent {$pjmId} afmeting={$afmeting}";
+                        continue;
+                    }
+                }
+            } else {
+                // Update parent product (title/content/status) and price
+                $postarr = [
+                    'ID' => $post_id,
+                    'post_title' => wp_strip_all_tags($title),
+                    'post_content' => $content,
+                    'post_status' => $isActive ? 'publish' : 'draft',
+                ];
+                wp_update_post($postarr);
+                update_post_meta($post_id, '_pjm_product_id', (string)$pjmId);
+                if (!empty($sku)) set_product_sku($post_id, $sku);
+                if ($price !== null) update_price_for_sku_or_variations($sku, $price, $post_id);
+                $updated++;
+                $new_post_id = $post_id;
+            }
+        } else {
+            // Create parent product (no parent mapping found)
+            $postarr = [
+                'post_title' => wp_strip_all_tags($title),
+                'post_content' => $content,
+                'post_status' => $isActive ? 'publish' : 'draft',
+                'post_type' => function_exists('wc_get_product') ? 'product' : 'post'
+            ];
+            $new_id = wp_insert_post($postarr);
+            if (is_wp_error($new_id) || !$new_id) { $errors[] = "Failed to insert product $pjmId ($title)"; continue; }
+            update_post_meta($new_id, '_pjm_product_id', (string)$pjmId);
+            if (!empty($sku)) set_product_sku($new_id, $sku);
+            if ($price !== null) update_price_for_sku_or_variations($sku, $price, $new_id);
+            $created++;
+            $new_post_id = $new_id;
+        }
+    }
+
+    // thumbnails (unchanged)
     $thumbSet = false;
     if (!empty($item['ThumbnailPath'])) {
         $aid = media_from_localfile($item['ThumbnailPath'], 'pjm_' . $pjmId . '_');
@@ -364,7 +430,13 @@ foreach ($data as $item) {
     }
 }
 
-// summary
+// regenerate lookups
+if (function_exists('wc_update_product_lookup_tables')) {
+    wc_update_product_lookup_tables();
+    if (PHP_SAPI === 'cli') fwrite(STDOUT, "Regenerated product lookup tables.\n");
+    else echo "Regenerated product lookup tables.<br />\n";
+}
+
 $summary = "Summary: created={$created}, updated={$updated}, errors=" . count($errors) . "\n";
 if (PHP_SAPI === 'cli') {
     fwrite(STDOUT, $summary);
