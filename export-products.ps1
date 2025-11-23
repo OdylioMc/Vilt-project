@@ -1,11 +1,14 @@
 <#
-Export-products.ps1
+Export-products.ps1 (modified)
 
-- Leest jouw semicolon-style DB_CONNECTION_STRING uit env (Azure SQL).
-- Exporteert products naar pjm-data/products.json.
-- Schrijft thumbnails als losse bestanden in pjm-data/images/<ProductId>.<ext>.
-- Voegt in de JSON voor elk product ThumbnailPath = "images/<file>" (relatief tov pjm-data).
-- Usage in workflow / locally:
+- Reads DB_CONNECTION_STRING from env (Azure SQL).
+- Exports products to pjm-data/products.json.
+- Writes thumbnails as files to pjm-data/images/<ProductId>.<ext>.
+- Adds ThumbnailPath = "images/<file>" in the JSON objects (relative to pjm-data).
+- Adds support for optional columns:
+    - Afmeting  (if present in the source table)
+    - ParentProductId or ParentId (exposed as ParentId in the JSON)
+- Usage:
     pwsh -NoProfile -NoLogo -File .\export-products.ps1 -OutputDir 'pjm-data' -MaxRows 10000
 #>
 
@@ -31,26 +34,73 @@ if (-not (Test-Path -Path $imagesDir)) {
   New-Item -ItemType Directory -Path $imagesDir -Force | Out-Null
 }
 
-# Query
+# Helper: get list of columns in the source table so we can optionally include Afmeting/ParentId
+Add-Type -AssemblyName System.Data
+try {
+  $metaConn = New-Object System.Data.SqlClient.SqlConnection $cs
+  $metaConn.Open()
+  $metaCmd = $metaConn.CreateCommand()
+  $metaCmd.CommandText = "
+    SELECT COLUMN_NAME
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'catalog' AND TABLE_NAME = 'Products';
+  "
+  $metaReader = $metaCmd.ExecuteReader()
+  $sourceCols = New-Object System.Collections.Generic.List[string]
+  while ($metaReader.Read()) {
+    $sourceCols.Add($metaReader.GetString(0))
+  }
+  $metaReader.Close()
+  $metaConn.Close()
+} catch {
+  Write-Warning "Could not read INFORMATION_SCHEMA.COLUMNS: $($_.Exception.Message)"
+  # fall back to safe default set (will fail later if columns truly missing)
+  $sourceCols = @('ProductId','CategoryId','SKU','Name','Description','Price','IsActive','CreatedAt','Thumbnail','ThumbnailContentType','ThumbnailUpdatedAt')
+}
+
+# Decide whether Afmeting and a ParentProductId/ParentId column exist
+$hasAfmeting = $sourceCols -contains 'Afmeting'
+$hasParentProductId = $sourceCols -contains 'ParentProductId'
+$hasParentId = $sourceCols -contains 'ParentId'
+
+# Build the SELECT column list dynamically so we only request columns that exist
+$baseCols = @(
+  '[ProductId]',
+  '[CategoryId]',
+  '[SKU]',
+  '[Name]',
+  '[Description]',
+  '[Price]',
+  '[IsActive]',
+  '[CreatedAt]',
+  '[Thumbnail]',
+  '[ThumbnailContentType]',
+  '[ThumbnailUpdatedAt]'
+)
+
+if ($hasAfmeting) {
+  $baseCols += '[Afmeting]'
+}
+
+# Build ParentId expression: use ParentProductId if present, else ParentId if present, else NULL as ParentId
+if ($hasParentProductId) {
+  $parentExpr = '[ParentProductId] AS ParentId'
+} elseif ($hasParentId) {
+  $parentExpr = '[ParentId] AS ParentId'
+} else {
+  $parentExpr = 'NULL AS ParentId'
+}
+
+$selectList = ($baseCols -join ",`n  ") + ",`n  " + $parentExpr
+
 $query = @"
 SELECT TOP ($MaxRows)
-  [ProductId],
-  [CategoryId],
-  [SKU],
-  [Name],
-  [Description],
-  [Price],
-  [IsActive],
-  [CreatedAt],
-  [Thumbnail],
-  [ThumbnailContentType],
-  [ThumbnailUpdatedAt]
+  $selectList
 FROM [catalog].[Products]
 ORDER BY [ProductId];
 "@
 
 try {
-  Add-Type -AssemblyName System.Data
   $conn = New-Object System.Data.SqlClient.SqlConnection $cs
   $cmd = $conn.CreateCommand()
   $cmd.CommandText = $query
@@ -97,7 +147,8 @@ foreach ($r in $dt.Rows) {
     # Save thumbnail bytes as files, and don't include raw byte[] in JSON
     if ($name -eq 'Thumbnail' -and $val -is [byte[]]) {
       $bytes = $val
-      $ct = $r['ThumbnailContentType']
+      $ct = $null
+      if ($dt.Columns.Contains('ThumbnailContentType')) { $ct = $r['ThumbnailContentType'] }
       $ext = Get-ExtensionFromContentType $ct
       $fname = "{0}{1}" -f $r['ProductId'], $ext
       $fullPath = Join-Path $imagesDir $fname
@@ -115,6 +166,27 @@ foreach ($r in $dt.Rows) {
 
     # Default assignment for other columns
     $obj[$name] = $val
+  }
+
+  # Ensure the JSON contains keys the importer expects:
+  # - ProductId, ParentId, SKU, Name, Price, Afmeting, ThumbnailPath, ThumbnailContentType
+  if (-not $obj.ContainsKey('ProductId')) { $obj['ProductId'] = $null }
+  if (-not $obj.ContainsKey('ParentId')) { $obj['ParentId'] = $null }
+  if (-not $obj.ContainsKey('SKU')) { $obj['SKU'] = $null }
+  if (-not $obj.ContainsKey('Name')) { $obj['Name'] = $null }
+  if (-not $obj.ContainsKey('Price')) { $obj['Price'] = $null }
+  if (-not $obj.ContainsKey('Afmeting')) { $obj['Afmeting'] = $null }
+  if (-not $obj.ContainsKey('ThumbnailPath')) { $obj['ThumbnailPath'] = $null }
+  if (-not $obj.ContainsKey('ThumbnailContentType')) { $obj['ThumbnailContentType'] = $null }
+
+  # Convert Price to string with dot decimal to make importer parsing consistent
+  if ($obj['Price'] -ne $null) {
+    try {
+      $num = [decimal]$obj['Price']
+      $obj['Price'] = $num.ToString("0.00", [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+      # leave as-is if conversion fails
+    }
   }
 
   $rows += $obj
