@@ -101,27 +101,56 @@ function find_post_by_pjm_id($pjmId) {
 }
 
 // media helpers (unchanged)
-function media_from_localfile($relativePath, $filenamePrefix = 'pjm_thumb_') {
+function media_from_localfile($relativePath, $filenamePrefix = 'pjm_thumb_', $post_parent = 0) {
     $upload_dir = wp_get_upload_dir();
     $full = trailingslashit($upload_dir['basedir']) . 'pjm-data/' . ltrim($relativePath, '/');
     if (!file_exists($full)) return 0;
-    $contents = file_get_contents($full);
-    if ($contents === false) return 0;
+
+    // Detect mime/type from file
+    $mime = '';
+    if (function_exists('finfo_open')) {
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        if ($finfo) {
+            $mime = finfo_file($finfo, $full);
+            finfo_close($finfo);
+        }
+    }
+    if (empty($mime) && function_exists('getimagesize')) {
+        $info = @getimagesize($full);
+        if ($info && !empty($info['mime'])) $mime = $info['mime'];
+    }
+    // Ensure extension matches mime or fallback to existing extension
     $ext = '.' . pathinfo($full, PATHINFO_EXTENSION);
-    $filename = $filenamePrefix . time() . $ext;
-    $upload = wp_upload_bits($filename, null, $contents);
-    if ($upload['error']) return 0;
-    $filetype = wp_check_filetype( $upload['file'], null );
+    $ext = strtolower($ext);
+    if (strpos($mime, 'jpeg') !== false) $ext = '.jpg';
+    elseif ($mime === 'image/png') $ext = '.png';
+    elseif ($mime === 'image/gif') $ext = '.gif';
+    elseif ($mime === 'image/webp') $ext = '.webp';
+
+    // Use the existing file path directly, but copy it into WP uploads area if it's not already there.
+    // If the file already resides in WP uploads (it does in your case /wp-content/uploads/pjm-data/...), we can attach it.
+    $wp_file = $full;
+
+    // Build attachment post record data
+    $filetype = wp_check_filetype( $wp_file, null );
     $attachment = [
-        'post_mime_type' => $filetype['type'],
-        'post_title'     => sanitize_file_name( basename( $upload['file'] ) ),
+        'post_mime_type' => $filetype['type'] ? $filetype['type'] : ($mime ?: 'image/png'),
+        'post_title'     => sanitize_file_name( basename( $wp_file ) ),
         'post_content'   => '',
         'post_status'    => 'inherit'
     ];
-    $attach_id = wp_insert_attachment( $attachment, $upload['file'] );
+
+    // Insert attachment; pass $post_parent to set the parent post if we have product post id
+    $attach_id = wp_insert_attachment( $attachment, $wp_file, $post_parent );
+    if ( is_wp_error($attach_id) || !$attach_id ) return 0;
+
     require_once( ABSPATH . 'wp-admin/includes/image.php' );
-    $attach_data = wp_generate_attachment_metadata( $attach_id, $upload['file'] );
+    $attach_data = wp_generate_attachment_metadata( $attach_id, $wp_file );
     wp_update_attachment_metadata( $attach_id, $attach_data );
+
+    // Ensure guid uses upload URL (sometimes wp_insert_attachment sets guid properly)
+    // set_post_thumbnail will create the _thumbnail_id meta for the product
+
     return $attach_id;
 }
 function media_from_base64($dataUri, $filenamePrefix = 'pjm_thumb_') {
@@ -409,25 +438,34 @@ foreach ($data as $item) {
         }
     }
 
-    // thumbnails (unchanged)
+    // thumbnails (verbeterd)
     $thumbSet = false;
     if (!empty($item['ThumbnailPath'])) {
-        $aid = media_from_localfile($item['ThumbnailPath'], 'pjm_' . $pjmId . '_');
-        if ($aid) { set_post_thumbnail($new_post_id, $aid); $thumbSet = true; }
+        // geef $new_post_id door zodat media_from_localfile het attachment als child kan aanmaken
+        $aid = media_from_localfile($item['ThumbnailPath'], 'pjm_' . $pjmId . '_', $new_post_id);
+        if ($aid && is_int($aid) && $aid > 0) {
+            set_post_thumbnail($new_post_id, $aid);
+            $thumbSet = true;
+        } else {
+            error_log("pjm-import: failed to import thumbnail for ProductId={$pjmId}, path={$item['ThumbnailPath']}");
+        }
     } elseif (!empty($item['ThumbnailDataUri'])) {
         $aid = media_from_base64($item['ThumbnailDataUri'], 'pjm_' . $pjmId . '_');
-        if ($aid) { set_post_thumbnail($new_post_id, $aid); $thumbSet = true; }
+        if ($aid && is_int($aid) && $aid > 0) {
+            set_post_thumbnail($new_post_id, $aid);
+            $thumbSet = true;
+        } else {
+            error_log("pjm-import: failed to import thumbnail (datauri) for ProductId={$pjmId}");
+        }
     } elseif (!empty($item['ThumbnailBase64']) && !empty($item['ThumbnailContentType'])) {
         $dataUri = 'data:' . $item['ThumbnailContentType'] . ';base64,' . $item['ThumbnailBase64'];
         $aid = media_from_base64($dataUri, 'pjm_' . $pjmId . '_');
-        if ($aid) { set_post_thumbnail($new_post_id, $aid); $thumbSet = true; }
-    }
-
-    if (PHP_SAPI === 'cli') {
-        fwrite(STDOUT, "Processed ProductId={$pjmId} -> post_id={$new_post_id}" . ($thumbSet ? " (thumb)" : "") . "\n");
-    } else {
-        echo "Processed ProductId={$pjmId} -> post_id={$new_post_id}" . ($thumbSet ? " (thumb)" : "") . "<br />\n";
-    }
+        if ($aid && is_int($aid) && $aid > 0) {
+            set_post_thumbnail($new_post_id, $aid);
+            $thumbSet = true;
+        } else {
+            error_log("pjm-import: failed to import thumbnail (base64) for ProductId={$pjmId}");
+        }
 }
 
 // regenerate lookups
