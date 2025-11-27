@@ -2,12 +2,13 @@
 Export-products.ps1 (modified)
 
 - Reads DB_CONNECTION_STRING from env (Azure SQL).
-- Exports products to pjm-data/products.json.
+- Exports products to pjm-data/products.json and pjm-data/products.csv.
 - Writes thumbnails as files to pjm-data/images/<ProductId>.<ext>.
 - Adds ThumbnailPath = "images/<file>" in the JSON objects (relative to pjm-data).
-- Adds support for optional columns:
-    - Afmeting  (if present in the source table)
-    - ParentProductId or ParentId (exposed as ParentId in the JSON)
+- Detects optional source columns: Afmeting, Kleur, Vorm, ParentProductId, ParentId.
+- Sets group_id in CSV as:
+    - ParentId (if present), otherwise
+    - Name (default grouping on Name as requested).
 - Usage:
     pwsh -NoProfile -NoLogo -File .\export-products.ps1 -OutputDir 'pjm-data' -MaxRows 10000
 #>
@@ -34,7 +35,7 @@ if (-not (Test-Path -Path $imagesDir)) {
   New-Item -ItemType Directory -Path $imagesDir -Force | Out-Null
 }
 
-# Helper: get list of columns in the source table so we can optionally include Afmeting/ParentId
+# Helper: get list of columns in the source table so we can optionally include Afmeting/Kleur/Vorm/ParentId
 Add-Type -AssemblyName System.Data
 try {
   $metaConn = New-Object System.Data.SqlClient.SqlConnection $cs
@@ -55,11 +56,13 @@ try {
 } catch {
   Write-Warning "Could not read INFORMATION_SCHEMA.COLUMNS: $($_.Exception.Message)"
   # fall back to safe default set (will fail later if columns truly missing)
-  $sourceCols = @('ProductId','CategoryId','SKU','Name','Description','Price','IsActive','CreatedAt','Thumbnail','ThumbnailContentType','ThumbnailUpdatedAt')
+  $sourceCols = @('ProductId','CategoryId','SKU','Name','Description','Price','IsActive','CreatedAt','Thumbnail','ThumbnailContentType','ThumbnailUpdatedAt','Afmeting','Kleur','Vorm','ParentProductId','ParentId')
 }
 
-# Decide whether Afmeting and a ParentProductId/ParentId column exist
+# Decide whether optional columns exist
 $hasAfmeting = $sourceCols -contains 'Afmeting'
+$hasKleur = $sourceCols -contains 'Kleur'
+$hasVorm = $sourceCols -contains 'Vorm'
 $hasParentProductId = $sourceCols -contains 'ParentProductId'
 $hasParentId = $sourceCols -contains 'ParentId'
 
@@ -78,9 +81,9 @@ $baseCols = @(
   '[ThumbnailUpdatedAt]'
 )
 
-if ($hasAfmeting) {
-  $baseCols += '[Afmeting]'
-}
+if ($hasAfmeting) { $baseCols += '[Afmeting]' }
+if ($hasKleur)    { $baseCols += '[Kleur]' }
+if ($hasVorm)     { $baseCols += '[Vorm]' }
 
 # Build ParentId expression: use ParentProductId if present, else ParentId if present, else NULL as ParentId
 if ($hasParentProductId) {
@@ -122,6 +125,7 @@ try {
 }
 
 $rows = @()
+$csvRows = @()
 
 function Get-ExtensionFromContentType($ct) {
   switch ($ct) {
@@ -169,15 +173,9 @@ foreach ($r in $dt.Rows) {
   }
 
   # Ensure the JSON contains keys the importer expects:
-  # - ProductId, ParentId, SKU, Name, Price, Afmeting, ThumbnailPath, ThumbnailContentType
-  if (-not $obj.ContainsKey('ProductId')) { $obj['ProductId'] = $null }
-  if (-not $obj.ContainsKey('ParentId')) { $obj['ParentId'] = $null }
-  if (-not $obj.ContainsKey('SKU')) { $obj['SKU'] = $null }
-  if (-not $obj.ContainsKey('Name')) { $obj['Name'] = $null }
-  if (-not $obj.ContainsKey('Price')) { $obj['Price'] = $null }
-  if (-not $obj.ContainsKey('Afmeting')) { $obj['Afmeting'] = $null }
-  if (-not $obj.ContainsKey('ThumbnailPath')) { $obj['ThumbnailPath'] = $null }
-  if (-not $obj.ContainsKey('ThumbnailContentType')) { $obj['ThumbnailContentType'] = $null }
+  foreach ($k in @('ProductId','ParentId','SKU','Name','Price','Afmeting','Kleur','Vorm','ThumbnailPath','ThumbnailContentType')) {
+    if (-not $obj.ContainsKey($k)) { $obj[$k] = $null }
+  }
 
   # Convert Price to string with dot decimal to make importer parsing consistent
   if ($obj['Price'] -ne $null) {
@@ -190,17 +188,48 @@ foreach ($r in $dt.Rows) {
   }
 
   $rows += $obj
+
+  # Also prepare CSV row for easier variable-product import (sku,name,price,afmeting,kleur,vorm,group_id)
+  $group_id = $obj['ParentId']
+  if (-not $group_id -or $group_id -eq $null -or $group_id -eq '') {
+    # default to Name grouping (option C)
+    $group_id = $obj['Name']
+  }
+  $csvObj = [PSCustomObject]@{
+    sku = ($obj['SKU'] -ne $null) ? $obj['SKU'] : ''
+    name = ($obj['Name'] -ne $null) ? $obj['Name'] : ''
+    price = ($obj['Price'] -ne $null) ? $obj['Price'] : ''
+    afmeting = ($obj['Afmeting'] -ne $null) ? $obj['Afmeting'] : ''
+    kleur = ($obj['Kleur'] -ne $null) ? $obj['Kleur'] : ''
+    vorm = ($obj['Vorm'] -ne $null) ? $obj['Vorm'] : ''
+    group_id = $group_id
+    ThumbnailPath = ($obj['ThumbnailPath'] -ne $null) ? $obj['ThumbnailPath'] : ''
+  }
+  $csvRows += $csvObj
 }
 
 # Write JSON to file (pretty printed)
-$outFile = Join-Path $OutputDir 'products.json'
+$outFileJson = Join-Path $OutputDir 'products.json'
 try {
   $json = $rows | ConvertTo-Json -Depth 6
-  # Write UTF8 (BOM may be present on some runners; importer handles BOM)
-  [System.IO.File]::WriteAllText($outFile, $json, [System.Text.Encoding]::UTF8)
-  Write-Host "Wrote $($rows.Count) products to $outFile"
+  [System.IO.File]::WriteAllText($outFileJson, $json, [System.Text.Encoding]::UTF8)
+  Write-Host "Wrote $($rows.Count) products to $outFileJson"
 } catch {
   Write-Error "Failed to write JSON: $($_.Exception.Message)"
+  exit 1
+}
+
+# Write CSV to file for the variable product import script (comma separated, UTF8)
+$outFileCsv = Join-Path $OutputDir 'products.csv'
+try {
+  if ($csvRows.Count -gt 0) {
+    $csvRows | Export-Csv -Path $outFileCsv -NoTypeInformation -Encoding UTF8
+    Write-Host "Wrote $($csvRows.Count) rows to $outFileCsv"
+  } else {
+    Write-Host "No CSV rows to write."
+  }
+} catch {
+  Write-Error "Failed to write CSV: $($_.Exception.Message)"
   exit 1
 }
 
