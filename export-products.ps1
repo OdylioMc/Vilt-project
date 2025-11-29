@@ -1,16 +1,5 @@
 <#
-Export-products.ps1 (modified)
-
-- Reads DB_CONNECTION_STRING from env (Azure SQL).
-- Exports products to pjm-data/products.json and pjm-data/products.csv.
-- Writes thumbnails as files to pjm-data/images/<ProductId>.<ext>.
-- Adds ThumbnailPath = "images/<file>" in the JSON objects (relative to pjm-data).
-- Detects optional source columns: Afmeting, Kleur, Vorm, ParentProductId, ParentId.
-- Sets group_id in CSV as:
-    - ParentId (if present), otherwise
-    - Name (default grouping on Name as requested).
-- Usage:
-    pwsh -NoProfile -NoLogo -File .\export-products.ps1 -OutputDir 'pjm-data' -MaxRows 10000
+(Deze versie is dezelfde als eerder maar voegt Description expliciet toe aan de CSV‑export.)
 #>
 
 param(
@@ -26,16 +15,10 @@ if (-not $cs -or $cs.Trim() -eq '') {
 
 Write-Host "Exporting up to $MaxRows products to '$OutputDir'..."
 
-# Prepare output dirs
-if (-not (Test-Path -Path $OutputDir)) {
-  New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-}
+if (-not (Test-Path -Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 $imagesDir = Join-Path $OutputDir 'images'
-if (-not (Test-Path -Path $imagesDir)) {
-  New-Item -ItemType Directory -Path $imagesDir -Force | Out-Null
-}
+if (-not (Test-Path -Path $imagesDir)) { New-Item -ItemType Directory -Path $imagesDir -Force | Out-Null }
 
-# Helper: get list of columns in the source table so we can optionally include Afmeting/Kleur/Vorm/ParentId
 Add-Type -AssemblyName System.Data
 try {
   $metaConn = New-Object System.Data.SqlClient.SqlConnection $cs
@@ -48,25 +31,21 @@ try {
   "
   $metaReader = $metaCmd.ExecuteReader()
   $sourceCols = New-Object System.Collections.Generic.List[string]
-  while ($metaReader.Read()) {
-    $sourceCols.Add($metaReader.GetString(0))
-  }
+  while ($metaReader.Read()) { $sourceCols.Add($metaReader.GetString(0)) }
   $metaReader.Close()
   $metaConn.Close()
 } catch {
   Write-Warning "Could not read INFORMATION_SCHEMA.COLUMNS: $($_.Exception.Message)"
-  # fall back to safe default set (will fail later if columns truly missing)
   $sourceCols = @('ProductId','CategoryId','SKU','Name','Description','Price','IsActive','CreatedAt','Thumbnail','ThumbnailContentType','ThumbnailUpdatedAt','Afmeting','Kleur','Vorm','ParentProductId','ParentId')
 }
 
-# Decide whether optional columns exist
 $hasAfmeting = $sourceCols -contains 'Afmeting'
 $hasKleur = $sourceCols -contains 'Kleur'
 $hasVorm = $sourceCols -contains 'Vorm'
 $hasParentProductId = $sourceCols -contains 'ParentProductId'
 $hasParentId = $sourceCols -contains 'ParentId'
+$hasDescription = $sourceCols -contains 'Description'
 
-# Build the SELECT column list dynamically so we only request columns that exist
 $baseCols = @(
   '[ProductId]',
   '[CategoryId]',
@@ -80,22 +59,13 @@ $baseCols = @(
   '[ThumbnailContentType]',
   '[ThumbnailUpdatedAt]'
 )
-
 if ($hasAfmeting) { $baseCols += '[Afmeting]' }
 if ($hasKleur)    { $baseCols += '[Kleur]' }
 if ($hasVorm)     { $baseCols += '[Vorm]' }
 
-# Build ParentId expression: use ParentProductId if present, else ParentId if present, else NULL as ParentId
-if ($hasParentProductId) {
-  $parentExpr = '[ParentProductId] AS ParentId'
-} elseif ($hasParentId) {
-  $parentExpr = '[ParentId] AS ParentId'
-} else {
-  $parentExpr = 'NULL AS ParentId'
-}
+if ($hasParentProductId) { $parentExpr = '[ParentProductId] AS ParentId' } elseif ($hasParentId) { $parentExpr = '[ParentId] AS ParentId' } else { $parentExpr = 'NULL AS ParentId' }
 
 $selectList = ($baseCols -join ",`n  ") + ",`n  " + $parentExpr
-
 $query = @"
 SELECT TOP ($MaxRows)
   $selectList
@@ -143,12 +113,8 @@ foreach ($r in $dt.Rows) {
   foreach ($c in $dt.Columns) {
     $name = $c.ColumnName
     $val = $r[$name]
-    if ($val -eq [System.DBNull]::Value) {
-      $obj[$name] = $null
-      continue
-    }
+    if ($val -eq [System.DBNull]::Value) { $obj[$name] = $null; continue }
 
-    # Save thumbnail bytes as files, and don't include raw byte[] in JSON
     if ($name -eq 'Thumbnail' -and $val -is [byte[]]) {
       $bytes = $val
       $ct = $null
@@ -158,43 +124,32 @@ foreach ($r in $dt.Rows) {
       $fullPath = Join-Path $imagesDir $fname
       try {
         [System.IO.File]::WriteAllBytes($fullPath, $bytes)
-        # store relative path into JSON object
         $obj['ThumbnailPath'] = "images/$fname"
-        # keep content type too
         if ($ct) { $obj['ThumbnailContentType'] = $ct }
       } catch {
         Write-Warning "Failed to write thumbnail for ProductId $($r['ProductId']): $($_.Exception.Message)"
       }
       continue
     }
-
-    # Default assignment for other columns
     $obj[$name] = $val
   }
 
-  # Ensure the JSON contains keys the importer expects:
-  foreach ($k in @('ProductId','ParentId','SKU','Name','Price','Afmeting','Kleur','Vorm','ThumbnailPath','ThumbnailContentType')) {
+  foreach ($k in @('ProductId','ParentId','SKU','Name','Price','Afmeting','Kleur','Vorm','ThumbnailPath','ThumbnailContentType','Description')) {
     if (-not $obj.ContainsKey($k)) { $obj[$k] = $null }
   }
 
-  # Convert Price to string with dot decimal to make importer parsing consistent
   if ($obj['Price'] -ne $null) {
     try {
       $num = [decimal]$obj['Price']
       $obj['Price'] = $num.ToString("0.00", [System.Globalization.CultureInfo]::InvariantCulture)
-    } catch {
-      # leave as-is if conversion fails
-    }
+    } catch { }
   }
 
   $rows += $obj
 
-  # Also prepare CSV row for easier variable-product import (sku,name,price,afmeting,kleur,vorm,group_id)
   $group_id = $obj['ParentId']
-  if (-not $group_id -or $group_id -eq $null -or $group_id -eq '') {
-    # default to Name grouping (option C)
-    $group_id = $obj['Name']
-  }
+  if (-not $group_id -or $group_id -eq $null -or $group_id -eq '') { $group_id = $obj['Name'] }
+
   $csvObj = [PSCustomObject]@{
     sku = ($obj['SKU'] -ne $null) ? $obj['SKU'] : ''
     name = ($obj['Name'] -ne $null) ? $obj['Name'] : ''
@@ -204,11 +159,11 @@ foreach ($r in $dt.Rows) {
     vorm = ($obj['Vorm'] -ne $null) ? $obj['Vorm'] : ''
     group_id = $group_id
     ThumbnailPath = ($obj['ThumbnailPath'] -ne $null) ? $obj['ThumbnailPath'] : ''
+    Description = ($obj['Description'] -ne $null) ? $obj['Description'] : ''
   }
   $csvRows += $csvObj
 }
 
-# Write JSON to file (pretty printed)
 $outFileJson = Join-Path $OutputDir 'products.json'
 try {
   $json = $rows | ConvertTo-Json -Depth 6
@@ -219,15 +174,12 @@ try {
   exit 1
 }
 
-# Write CSV to file for the variable product import script (comma separated, UTF8)
 $outFileCsv = Join-Path $OutputDir 'products.csv'
 try {
   if ($csvRows.Count -gt 0) {
     $csvRows | Export-Csv -Path $outFileCsv -NoTypeInformation -Encoding UTF8
     Write-Host "Wrote $($csvRows.Count) rows to $outFileCsv"
-  } else {
-    Write-Host "No CSV rows to write."
-  }
+  } else { Write-Host "No CSV rows to write." }
 } catch {
   Write-Error "Failed to write CSV: $($_.Exception.Message)"
   exit 1
