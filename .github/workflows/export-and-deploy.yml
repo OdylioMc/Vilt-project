@@ -1,5 +1,5 @@
 name: Export products and deploy to WordPress
-
+ 
 on:
   workflow_dispatch:
   push:
