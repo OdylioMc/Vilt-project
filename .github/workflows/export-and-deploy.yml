@@ -1,4 +1,4 @@
-name: Export products and deploy to WordPress
+name: Export products and deploy to Word Press
  
 on:
   workflow_dispatch:
