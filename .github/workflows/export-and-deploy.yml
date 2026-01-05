@@ -1,5 +1,7 @@
-name: Export products and deploy to WordPress
- 
+# Export products and deploy to WordPress (updated to fix remote upload permissions)
+# - uploads pjm-data via scp
+# - then fixes permissions (directories 755, files 644)
+# - optionally attempts to chown to a web user if WP_SSH_CHOWN=true and WP_SSH_CHOWN_USER set
 on:
   workflow_dispatch:
   push:
@@ -38,7 +40,7 @@ jobs:
         run: |
           Write-Host 'Current directory:' (Get-Location).Path
           Write-Host 'Repository root listing:'
-          Get-ChildItem -Force -File -Recurse -Depth 1 | ForEach-Object { Write-Host '  ' $_.FullName }
+          Get-ChildItem -Force -Recurse -Depth 1 | ForEach-Object { Write-Host '  ' $_.FullName }
           if (Test-Path -Path './pjm-data') {
             Write-Host 'pjm-data exists. Listing contents:'
             Get-ChildItem -Path './pjm-data' -Recurse | ForEach-Object { Write-Host '  ' $_.FullName }
@@ -53,7 +55,7 @@ jobs:
           name: pjm-export
           path: pjm-data/**
 
-      - name: Upload via SFTP/SSH (OpenSSH scp)
+      - name: Upload via SFTP/SSH (OpenSSH scp) and fix remote perms
         env:
           WP_SSH_HOST: ${{ secrets.WP_SSH_HOST }}
           WP_SSH_PORT: ${{ secrets.WP_SSH_PORT }}
@@ -62,6 +64,9 @@ jobs:
           WP_SSH_KEY_B64: ${{ secrets.WP_SSH_KEY_B64 }}
           WP_TARGET_PATH: ${{ secrets.WP_TARGET_PATH }}
           WP_SSH_KNOWN_HOSTS: ${{ secrets.WP_SSH_KNOWN_HOSTS }}
+          # Optional: set these secrets to enable chown on remote (requires sudo without password)
+          # WP_SSH_CHOWN: 'true'
+          # WP_SSH_CHOWN_USER: 'www-data:www-data'
         shell: pwsh
         run: |
           pwsh -NoProfile -NoLogo -Command {
@@ -122,4 +127,42 @@ jobs:
             Write-Host "SCP command: $($scpCmd -join ' ')"
             $proc2 = Start-Process -FilePath $scpCmd[0] -ArgumentList $scpCmd[1..($scpCmd.Length-1)] -NoNewWindow -Wait -PassThru
             if ($proc2.ExitCode -ne 0) { Write-Error "SCP failed with exit code $($proc2.ExitCode)"; exit $proc2.ExitCode } else { Write-Host "Upload successful." }
+
+            # ---------------------------
+            # Remote permissions fix
+            # ---------------------------
+            try {
+              # Remote path to the uploaded data (ensure trailing path correct)
+              $remoteDataPath = "$($env:WP_TARGET_PATH)/pjm-data"
+
+              # Build the remote command: set directories to 755 and files to 644
+              $fixPermCmd = "if [ -d `"$remoteDataPath`" ]; then find `"$remoteDataPath`" -type d -exec chmod 755 {} \; && find `"$remoteDataPath`" -type f -exec chmod 644 {} \;; else echo 'Remote path not found: $remoteDataPath'; fi"
+
+              $sshFixCmd = @("ssh","-i",$keyFile,"-p",$env:WP_SSH_PORT) + $sshOptions + @("$($env:WP_SSH_USER)@$($env:WP_SSH_HOST)","$fixPermCmd")
+              Write-Host "Running remote permission-fix: $($sshFixCmd -join ' ')"
+              $proc3 = Start-Process -FilePath $sshFixCmd[0] -ArgumentList $sshFixCmd[1..($sshFixCmd.Length-1)] -NoNewWindow -Wait -PassThru
+              if ($proc3.ExitCode -ne 0) {
+                Write-Warning "Remote chmod command failed with exit code $($proc3.ExitCode)"
+              } else {
+                Write-Host "Remote permissions fixed (chmod)."
+              }
+
+              # Optional: change owner if requested. This requires the SSH user to have passwordless sudo.
+              if ($env:WP_SSH_CHOWN -and $env:WP_SSH_CHOWN.ToLower() -eq 'true') {
+                $targetOwner = if ($env:WP_SSH_CHOWN_USER -and $env:WP_SSH_CHOWN_USER -ne '') { $env:WP_SSH_CHOWN_USER } else { 'www-data:www-data' }
+                $fixOwnerCmd = "if [ -d `"$remoteDataPath`" ]; then sudo chown -R $targetOwner `"$remoteDataPath`" && sudo find `"$remoteDataPath`" -type d -exec chmod 755 {} \; && sudo find `"$remoteDataPath`" -type f -exec chmod 644 {} \;; else echo 'Remote path not found for chown: $remoteDataPath'; fi"
+                $sshChownCmd = @("ssh","-i",$keyFile,"-p",$env:WP_SSH_PORT) + $sshOptions + @("$($env:WP_SSH_USER)@$($env:WP_SSH_HOST)","$fixOwnerCmd")
+                Write-Host "Attempting remote chown+chmod (requires sudo): $($sshChownCmd -join ' ')"
+                $proc4 = Start-Process -FilePath $sshChownCmd[0] -ArgumentList $sshChownCmd[1..($sshChownCmd.Length-1)] -NoNewWindow -Wait -PassThru
+                if ($proc4.ExitCode -ne 0) {
+                  Write-Warning "Remote chown/chmod failed (exit code $($proc4.ExitCode)). If you need chown, ensure the SSH user has passwordless sudo or run manually on the server."
+                } else {
+                  Write-Host "Remote ownership and permissions adjusted with sudo."
+                }
+              }
+
+            } catch {
+              Write-Warning "Failed to fix remote permissions: $($_.Exception.Message)"
+            }
+
           }
